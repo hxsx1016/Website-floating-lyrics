@@ -235,8 +235,8 @@ inline void StaggerLetterTimes(LyricLine& line, double endSec) {
             const double base = line.words[i].timeSec;
             const double nextT = (j < line.words.size()) ? line.words[j].timeSec : endSec;
             double clusterDur = nextT - base;
-            if (clusterDur < 0.05) clusterDur = std::max(0.05, line.words[i].durationSec);
-            clusterDur = std::clamp(clusterDur, 0.026 * static_cast<double>(count), 0.072 * static_cast<double>(count));
+            if (clusterDur < 0.06) clusterDur = std::max(0.06, line.words[i].durationSec);
+            clusterDur = std::clamp(clusterDur, 0.032 * static_cast<double>(count), 0.086 * static_cast<double>(count));
             const double step = clusterDur / static_cast<double>(count);
             for (size_t k = 0; k < count; ++k) {
                 line.words[i + k].timeSec = base + static_cast<double>(k) * step;

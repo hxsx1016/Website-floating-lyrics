@@ -274,7 +274,7 @@ private:
                 std::lock_guard<std::mutex> lock(mu_);
                 current_ = bp;
             }
-            for (int i = 0; i < 8 && running_; ++i) {
+            for (int i = 0; i < 20 && running_; ++i) {
                 Sleep(50);
             }
         }

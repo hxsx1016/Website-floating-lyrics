@@ -59,6 +59,19 @@ constexpr UINT kHotkeyOpen = 5;
 constexpr UINT kHotkeyFloat = 6;
 constexpr UINT kHotkeyPanel = 7;
 
+constexpr float kLimbusCharInterval = 0.100f;
+constexpr float kLimbusFade = 0.28f;
+constexpr float kLimbusOverlap = 0.45f;
+constexpr float kLimbusMinLife = 4.8f;
+constexpr float kLimbusMaxLife = 6.5f;
+constexpr int kLimbusMaxLines = 5;
+constexpr float kLimbusShake = 2.4f;
+constexpr float kLimbusShakeFollow = 0.22f;
+constexpr ULONGLONG kLimbusShakeMs = 90;
+constexpr float kLimbusCharSpace = 5.0f;
+constexpr float kLimbusMargin = 35.0f;
+constexpr COLORREF kLimbusShadow = RGB(216, 165, 35);
+
 constexpr int ID_TRAY_OPEN = 1001;
 constexpr int ID_TRAY_PLAY = 1002;
 constexpr int ID_TRAY_LOCK = 1003;
@@ -168,6 +181,7 @@ struct AppState {
     double lastSyncedPos = -1.0;
     ULONGLONG lastTick = 0;
     ULONGLONG lastManualSeekMs = 0;
+    double lastManualSeekTarget = -1.0;
     int currentIndex = -1;
     float fontSize = 42.0f;
     COLORREF lyricColor = RGB(255, 236, 160);
@@ -193,9 +207,23 @@ struct AppState {
         float y = 0;
         float angle = 0;
         float size = 42;
+        float boxW = 220;
+        float boxH = 60;
+        std::vector<float> widths;
+        std::vector<float> shakeX;
+        std::vector<float> shakeY;
+        std::vector<float> targetX;
+        std::vector<float> targetY;
+        ULONGLONG lastShakeMs = 0;
     };
     std::vector<FloatLineVisual> floatVis;
     std::wstring floatVisKey;
+    HDC overlayMem = nullptr;
+    HBITMAP overlayBmp = nullptr;
+    HGDIOBJ overlayOld = nullptr;
+    void* overlayBits = nullptr;
+    int overlayW = 0;
+    int overlayH = 0;
 };
 
 AppState g;
@@ -413,12 +441,22 @@ void DrawOutlinedText(Gdiplus::Graphics& gp,
 }
 
 float MeasureGlyph(Gdiplus::Graphics& gp, const Gdiplus::FontFamily& family, float size, const std::wstring& ch) {
+    static float cacheSize = 0;
+    static float cache[128]{};
+    const wchar_t c = ch.empty() ? L' ' : ch[0];
+    if (std::abs(cacheSize - size) > 0.4f) {
+        cacheSize = size;
+        for (float& v : cache) v = 0;
+    }
+    if (c < 128 && cache[c] > 0.1f) return cache[c];
     Gdiplus::Font font(&family, size, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
     Gdiplus::StringFormat typo(Gdiplus::StringFormat::GenericTypographic());
     typo.SetFormatFlags(Gdiplus::StringFormatFlagsMeasureTrailingSpaces | Gdiplus::StringFormatFlagsNoWrap);
     Gdiplus::RectF bb;
     gp.MeasureString(ch.c_str(), 1, &font, Gdiplus::PointF(0, 0), &typo, &bb);
-    return std::max(size * 0.28f, bb.Width);
+    const float w = std::max(size * 0.28f, bb.Width);
+    if (c < 128) cache[c] = w;
+    return w;
 }
 
 void DrawOffsetGlyph(Gdiplus::Graphics& gp,
@@ -464,28 +502,115 @@ void DrawOffsetGlyph(Gdiplus::Graphics& gp,
     gp.Restore(st);
 }
 
-AppState::FloatLineVisual& EnsureFloatVisual(int index, int w, int h, float size) {
+void DrawLimbusGlyph(Gdiplus::Graphics& gp,
+                     const std::wstring& ch,
+                     const Gdiplus::FontFamily& family,
+                     float size,
+                     float x,
+                     float y,
+                     BYTE alpha) {
+    if (ch.empty() || alpha == 0) return;
+    Gdiplus::StringFormat fmt(Gdiplus::StringFormat::GenericTypographic());
+    fmt.SetAlignment(Gdiplus::StringAlignmentNear);
+    fmt.SetLineAlignment(Gdiplus::StringAlignmentNear);
+    fmt.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap | Gdiplus::StringFormatFlagsNoClip);
+    Gdiplus::RectF layout(0, 0, size * 4.0f, size * 2.0f);
+    Gdiplus::GraphicsPath path;
+    path.AddString(ch.c_str(), -1, &family, Gdiplus::FontStyleBold, size, layout, &fmt);
+
+    Gdiplus::GraphicsState st = gp.Save();
+    gp.TranslateTransform(x + 3.0f, y + 3.0f);
+    Gdiplus::SolidBrush shadow(MakeColor(RGB(255, 255, 255), alpha));
+    gp.FillPath(&shadow, &path);
+    gp.Restore(st);
+
+    st = gp.Save();
+    gp.TranslateTransform(x, y);
+    Gdiplus::SolidBrush fill(MakeColor(g.lyricColor, alpha));
+    gp.FillPath(&fill, &path);
+    gp.Restore(st);
+}
+
+AppState::FloatLineVisual& EnsureFloatVisual(int index, int w, int h, float size, float boxW, float boxH) {
     for (auto& v : g.floatVis) {
         if (v.index == index) return v;
     }
     AppState::FloatLineVisual v;
     v.index = index;
     v.size = size;
-    v.angle = Mix01(index, 19) * 8.0f - 4.0f;
-    const float boxW = std::min(static_cast<float>(w) * 0.82f, 1100.0f);
-    const float boxH = size * 1.8f;
-    v.x = 48.0f + Mix01(index, 11) * std::max(40.0f, w - boxW - 96.0f);
-    v.y = 48.0f + Mix01(index, 29) * std::max(40.0f, h - boxH - 96.0f);
-    for (const auto& other : g.floatVis) {
-        if (std::abs(other.y - v.y) < size * 1.6f && std::abs(other.x - v.x) < boxW * 0.35f) {
-            v.y = std::clamp(other.y + size * 1.7f, 40.0f, static_cast<float>(h) - boxH - 40.0f);
+    v.boxW = boxW;
+    v.boxH = boxH;
+    v.angle = Mix01(index, 19) * 16.0f - 8.0f;
+    const float minX = kLimbusMargin;
+    const float minY = kLimbusMargin;
+    const float maxX = std::max(minX, static_cast<float>(w) - boxW - kLimbusMargin);
+    const float maxY = std::max(minY, static_cast<float>(h) - boxH - kLimbusMargin);
+    float bestX = minX, bestY = minY, bestScore = -1e9f;
+    for (int tryN = 0; tryN < 80; ++tryN) {
+        const float x = minX + Mix01(index, 11 + tryN * 3) * (maxX - minX);
+        const float y = minY + Mix01(index, 29 + tryN * 7) * (maxY - minY);
+        float score = 0.0f;
+        for (const auto& other : g.floatVis) {
+            const float ox = other.x - 30.0f;
+            const float oy = other.y - 30.0f;
+            const float ow = other.boxW + 60.0f;
+            const float oh = other.boxH + 60.0f;
+            const float ix = std::max(0.0f, std::min(x + boxW, ox + ow) - std::max(x, ox));
+            const float iy = std::max(0.0f, std::min(y + boxH, oy + oh) - std::max(y, oy));
+            score -= ix * iy;
+        }
+        if (score > -1.0f) {
+            bestX = x;
+            bestY = y;
+            break;
+        }
+        if (score > bestScore) {
+            bestScore = score;
+            bestX = x;
+            bestY = y;
         }
     }
+    v.x = bestX;
+    v.y = bestY;
     g.floatVis.push_back(v);
-    if (g.floatVis.size() > 12) {
-        g.floatVis.erase(g.floatVis.begin());
-    }
     return g.floatVis.back();
+}
+
+void ClampLineOnScreen(AppState::FloatLineVisual& vis, float total, float size, int w, int h) {
+    const float pad = kLimbusMargin + kLimbusShake + 8.0f;
+    auto measure = [&](float ang, float& bw, float& bh) {
+        const float rad = ang * 3.14159265f / 180.0f;
+        bw = std::abs(total * std::cos(rad)) + size * std::abs(std::sin(rad)) + 18.0f;
+        bh = std::abs(total * std::sin(rad)) + size * std::abs(std::cos(rad)) + 18.0f;
+    };
+    float bw = 0, bh = 0;
+    measure(vis.angle, bw, bh);
+    const float maxW = std::max(48.0f, static_cast<float>(w) - 2.0f * pad);
+    const float maxH = std::max(48.0f, static_cast<float>(h) - 2.0f * pad);
+    for (int i = 0; i < 8 && (bw > maxW || bh > maxH); ++i) {
+        vis.angle *= 0.62f;
+        measure(vis.angle, bw, bh);
+    }
+    vis.boxW = bw;
+    vis.boxH = bh;
+
+    const float rad = vis.angle * 3.14159265f / 180.0f;
+    const float dx = std::cos(rad);
+    const float dy = std::sin(rad);
+    float minX = vis.x, minY = vis.y, maxX = vis.x + size, maxY = vis.y + size;
+    const float endX = vis.x + total * dx;
+    const float endY = vis.y + total * dy;
+    minX = std::min(minX, endX);
+    minY = std::min(minY, endY);
+    maxX = std::max(maxX, endX + size);
+    maxY = std::max(maxY, endY + size);
+    float ox = 0, oy = 0;
+    if (minX < pad) ox = pad - minX;
+    if (minY < pad) oy = pad - minY;
+    if (maxX + ox > w - pad) ox -= (maxX + ox) - (w - pad);
+    if (maxY + oy > h - pad) oy -= (maxY + oy) - (h - pad);
+    vis.x += ox;
+    vis.y += oy;
 }
 
 void DrawPopLine(Gdiplus::Graphics& gp,
@@ -518,35 +643,15 @@ void DrawPopLine(Gdiplus::Graphics& gp,
     float cursor = 0;
     for (size_t i = 0; i < line.words.size(); ++i) {
         const auto& w = line.words[i];
-        if (t + 0.08 < w.timeSec) {
+        if (t + 0.01 < w.timeSec) {
             cursor += widths[i];
             continue;
         }
-        float age = static_cast<float>(t - w.timeSec);
-        float pop = 1.0f;
-        if (age < 0.10f) {
-            float k = EaseInOut(age / 0.10f);
-            pop = 1.32f - 0.32f * k;
-        }
-        const int bucket = static_cast<int>(t * 14.0) + static_cast<int>(i);
-        const float shakeX = (Mix01(static_cast<int>(i) + 3, bucket) - 0.5f) * 3.2f;
-        const float shakeY = (Mix01(static_cast<int>(i) + 9, bucket + 4) - 0.5f) * 3.2f;
-        const float px = x + cursor * dx + shakeX;
-        const float py = originY + cursor * dy + shakeY;
-        DrawOffsetGlyph(gp, w.text, family, size, px, py, angle, fill, alpha, pop, solid);
+        const float px = x + cursor * dx;
+        const float py = originY + cursor * dy;
+        DrawOffsetGlyph(gp, w.text, family, size, px, py, 0.0f, fill, alpha, 1.0f, solid);
         cursor += widths[i];
     }
-}
-
-float FloatLineAlpha(double t, double start, double end) {
-    const double dur = std::max(0.35, end - start);
-    const float fadeIn = static_cast<float>(std::min(0.55, dur * 0.22));
-    const float fadeOut = static_cast<float>(std::min(0.85, dur * 0.28));
-    const float local = static_cast<float>(t - start);
-    if (local < 0.0f) return 0.0f;
-    if (local < fadeIn) return EaseInOut(local / fadeIn);
-    if (local > dur - fadeOut) return EaseInOut(1.0f - (local - (static_cast<float>(dur) - fadeOut)) / fadeOut);
-    return 1.0f;
 }
 
 void DrawFloatLyrics(Gdiplus::Graphics& gp, int w, int h, const Gdiplus::FontFamily& family) {
@@ -576,44 +681,101 @@ void DrawFloatLyrics(Gdiplus::Graphics& gp, int w, int h, const Gdiplus::FontFam
 
     const double t = LyricTime();
     const int n = static_cast<int>(g.song.lines.size());
-    const int current = g.currentIndex;
+    const float size = std::clamp(g.fontSize * 0.95f, 28.0f, 62.0f);
 
-    auto lineEnd = [&](int i) -> double {
-        const double start = g.song.lines[i].timeSec - 0.2;
-        double end = start + 8.0;
+    auto lineLife = [&](int i, double& start, double& end) {
+        start = g.song.lines[i].timeSec - 0.2;
         if (i + 1 < n) {
-            const double desired = g.song.lines[i + 1].timeSec + 1.2;
-            end = std::clamp(desired, start + 6.0, start + 10.0);
+            const double desired = g.song.lines[i + 1].timeSec + kLimbusOverlap;
+            end = std::clamp(desired, start + kLimbusMinLife, start + kLimbusMaxLife);
+        } else {
+            end = start + kLimbusMaxLife;
         }
-        return end;
     };
 
     std::vector<int> visible;
     for (int i = 0; i < n; ++i) {
-        const double start = g.song.lines[i].timeSec - 0.2;
-        if (t >= start && t <= lineEnd(i)) visible.push_back(i);
+        double start = 0, end = 0;
+        lineLife(i, start, end);
+        if (t >= start && t <= end + kLimbusFade) visible.push_back(i);
         if (g.song.lines[i].timeSec > t + 0.4) break;
     }
-    if (static_cast<int>(visible.size()) > 5) {
-        visible.erase(visible.begin(), visible.end() - 5);
+    if (static_cast<int>(visible.size()) > kLimbusMaxLines) {
+        visible.erase(visible.begin(), visible.end() - kLimbusMaxLines);
     }
-    if (visible.empty() && current >= 0) visible.push_back(current);
 
     g.floatVis.erase(std::remove_if(g.floatVis.begin(), g.floatVis.end(), [&](const AppState::FloatLineVisual& v) {
         return std::find(visible.begin(), visible.end(), v.index) == visible.end();
     }), g.floatVis.end());
 
+    const ULONGLONG nowMs = GetTickCount64();
     for (int i : visible) {
-        const bool isCurrent = (i == current);
-        float size = std::clamp(g.fontSize * (isCurrent ? 1.28f : 0.82f), 22.0f, 88.0f);
-        auto& vis = EnsureFloatVisual(i, w, h, size);
-        vis.size = size;
-        float a = FloatLineAlpha(t, g.song.lines[i].timeSec - 0.2, lineEnd(i));
-        if (a < 0.05f && isCurrent) a = 1.0f;
-        BYTE alpha = static_cast<BYTE>(std::clamp(a * (isCurrent ? 255.0f : 170.0f), 0.0f, 255.0f));
-        COLORREF color = isCurrent ? g.lyricColor : RGB(236, 240, 248);
-        DrawPopLine(gp, g.song.lines[i], family, size, vis.x, vis.y, vis.angle, color, alpha, t,
-                    Gdiplus::StringAlignmentNear, true);
+        const auto& line = g.song.lines[i];
+        double start = 0, end = 0;
+        lineLife(i, start, end);
+        float opacity = 1.0f;
+        if (t >= end) {
+            opacity = std::clamp(1.0f - static_cast<float>((t - end) / kLimbusFade), 0.0f, 1.0f);
+        }
+        if (opacity <= 0.01f) continue;
+
+        auto& vis = EnsureFloatVisual(i, w, h, size, 220.0f, size * 1.8f + 16.0f);
+        if (vis.widths.size() != line.words.size() || std::abs(vis.size - size) > 0.4f) {
+            vis.widths.resize(line.words.size());
+            float total = 0;
+            for (size_t k = 0; k < line.words.size(); ++k) {
+                vis.widths[k] = MeasureGlyph(gp, family, size, line.words[k].text);
+                total += vis.widths[k] + kLimbusCharSpace;
+            }
+            vis.size = size;
+            vis.boxW = std::max(80.0f, total + 24.0f);
+            vis.boxH = size * 1.8f + 16.0f;
+        }
+        {
+            float total = 0;
+            for (float cw : vis.widths) total += cw + kLimbusCharSpace;
+            ClampLineOnScreen(vis, total, size, w, h);
+        }
+        if (vis.shakeX.size() != line.words.size()) {
+            vis.shakeX.assign(line.words.size(), 0.0f);
+            vis.shakeY.assign(line.words.size(), 0.0f);
+            vis.targetX.assign(line.words.size(), 0.0f);
+            vis.targetY.assign(line.words.size(), 0.0f);
+        }
+        if (nowMs - vis.lastShakeMs >= kLimbusShakeMs) {
+            vis.lastShakeMs = nowMs;
+            const int tick = static_cast<int>(nowMs / kLimbusShakeMs);
+            for (size_t k = 0; k < line.words.size(); ++k) {
+                vis.targetX[k] = Mix01(i + tick * 17, static_cast<int>(k) + 3) * (kLimbusShake * 2.0f) - kLimbusShake;
+                vis.targetY[k] = Mix01(i + tick * 23, static_cast<int>(k) + 9) * (kLimbusShake * 2.0f) - kLimbusShake;
+            }
+        }
+        for (size_t k = 0; k < line.words.size(); ++k) {
+            vis.shakeX[k] += (vis.targetX[k] - vis.shakeX[k]) * kLimbusShakeFollow;
+            vis.shakeY[k] += (vis.targetY[k] - vis.shakeY[k]) * kLimbusShakeFollow;
+        }
+
+        const float rad = vis.angle * 3.14159265f / 180.0f;
+        const float dx = std::cos(rad);
+        const float dy = std::sin(rad);
+        float cursor = 0;
+        int shown = 0;
+        for (size_t k = 0; k < line.words.size(); ++k) {
+            const auto& word = line.words[k];
+            const double appear = start + static_cast<double>(shown) * kLimbusCharInterval;
+            if (!word.text.empty() && !iswspace(word.text[0])) ++shown;
+            const float age = static_cast<float>(t - appear);
+            if (age < -0.02f) {
+                cursor += vis.widths[k] + kLimbusCharSpace;
+                continue;
+            }
+            const float appearK = EaseInOut(std::clamp(age / 0.26f, 0.0f, 1.0f));
+            const BYTE glyphA = static_cast<BYTE>(std::clamp(opacity * appearK * 255.0f, 0.0f, 255.0f));
+            const float px = vis.x + cursor * dx + vis.shakeX[k];
+            const float py = vis.y + cursor * dy + vis.shakeY[k];
+            DrawLimbusGlyph(gp, word.text, family, size, px, py, glyphA);
+            cursor += vis.widths[k] + kLimbusCharSpace;
+        }
     }
 }
 
@@ -640,6 +802,31 @@ void ManualSearch();
 void ChooseColorDialog();
 void CreateControlPanel(HINSTANCE inst);
 
+void EnsureOverlayBuffer(HDC screen, int w, int h) {
+    if (g.overlayMem && g.overlayW == w && g.overlayH == h && g.overlayBmp) return;
+    if (g.overlayMem) {
+        SelectObject(g.overlayMem, g.overlayOld);
+        DeleteObject(g.overlayBmp);
+        DeleteDC(g.overlayMem);
+        g.overlayMem = nullptr;
+        g.overlayBmp = nullptr;
+        g.overlayOld = nullptr;
+        g.overlayBits = nullptr;
+    }
+    g.overlayMem = CreateCompatibleDC(screen);
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    g.overlayBmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &g.overlayBits, nullptr, 0);
+    g.overlayOld = SelectObject(g.overlayMem, g.overlayBmp);
+    g.overlayW = w;
+    g.overlayH = h;
+}
+
 void PaintOverlay() {
     RECT rc{};
     GetClientRect(g.hwnd, &rc);
@@ -648,24 +835,14 @@ void PaintOverlay() {
     if (w <= 0 || h <= 0) return;
 
     HDC screen = GetDC(g.hwnd);
-    HDC mem = CreateCompatibleDC(screen);
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr;
-    HBITMAP bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    HGDIOBJ old = SelectObject(mem, bmp);
+    EnsureOverlayBuffer(screen, w, h);
+    HDC mem = g.overlayMem;
 
     {
         Gdiplus::Graphics gp(mem);
         gp.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        gp.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
         gp.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
-        gp.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        gp.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
         gp.Clear(Gdiplus::Color(0, 0, 0, 0));
 
         Gdiplus::FontFamily yahei(L"Microsoft YaHei UI");
@@ -774,10 +951,6 @@ void PaintOverlay() {
     blend.SourceConstantAlpha = 255;
     blend.AlphaFormat = AC_SRC_ALPHA;
     UpdateLayeredWindow(g.hwnd, screen, &ptDst, &sizeWnd, mem, &ptSrc, 0, &blend, ULW_ALPHA);
-
-    SelectObject(mem, old);
-    DeleteObject(bmp);
-    DeleteDC(mem);
     ReleaseDC(g.hwnd, screen);
 }
 
@@ -1041,17 +1214,22 @@ bool HitProgressBar(POINT pt, int w, int h, double& ratioOut) {
 
 void SeekTo(double sec) {
     sec = std::max(0.0, sec);
+    const ULONGLONG now = GetTickCount64();
     if (UsingVideoTimeline()) {
         g.lastVideoPos = sec;
-        g.lastVideoPosMs = GetTickCount64();
+        g.lastVideoPosMs = now;
         if (g.vocalClock) g.playhead = std::max(0.0, sec + g.vocalOffset);
         else g.playhead = sec;
     } else {
         g.playhead = sec;
         if (g.vocalClock) g.vocalOffset = g.playhead - g.now.positionSec;
     }
+    g.videoClockPos = g.playhead;
+    g.videoClockMs = now;
+    g.lastRawVideoPos = -1.0;
     g.lastSyncedPos = g.playhead;
-    g.lastManualSeekMs = GetTickCount64();
+    g.lastManualSeekMs = now;
+    g.lastManualSeekTarget = sec;
     g.currentIndex = FindLyricIndex(g.song, g.playhead);
     g.media.OverridePosition(UsingVideoTimeline() ? sec : g.playhead);
     PaintOverlay();
@@ -1818,7 +1996,7 @@ void CreateControlPanel(HINSTANCE inst) {
 
     BOOL dark = TRUE;
     DwmSetWindowAttribute(g.hwndCtrl, 20, &dark, sizeof(dark));
-    SetTimer(g.hwndCtrl, kCtrlTimerId, 200, nullptr);
+    SetTimer(g.hwndCtrl, kCtrlTimerId, 500, nullptr);
     ShowWindow(g.hwndCtrl, SW_SHOW);
     g.ctrlVisible = true;
     PaintControl();
@@ -1902,11 +2080,15 @@ void SyncFromSystem() {
         if (!videoAppEarly && np.playing && np.stampMs) {
             reported += std::clamp((now - np.stampMs) / 1000.0, 0.0, 0.25);
         }
-        const bool manualHold = (now - g.lastManualSeekMs) < 400;
+        const bool manualHold = (now - g.lastManualSeekMs) < 450;
         if (!manualHold) {
             const double lyricReported = reported + (g.vocalClock ? g.vocalOffset : 0.0);
             if (videoAppEarly) {
                 const double raw = np.fromBiliBar ? reported : np.rawPositionSec;
+                const double probePos = (raw >= 0.0) ? raw : reported;
+                const bool staleAfterSeek = g.lastManualSeekTarget >= 0.0 &&
+                    std::abs(probePos - g.lastManualSeekTarget) > 1.5 &&
+                    std::abs(probePos - g.playhead) > 1.8;
                 const bool rawMoved = (g.lastRawVideoPos >= 0.0 && raw >= 0.0 &&
                                        std::abs(raw - g.lastRawVideoPos) > (np.fromBiliBar ? 0.45 : 0.28));
                 const bool frozenZero = !np.fromBiliBar && raw >= 0.0 && raw < 0.8 &&
@@ -1915,38 +2097,73 @@ void SyncFromSystem() {
                                       raw + 1.2 < g.playhead;
                 const bool seekFwd = rawMoved && raw > g.playhead + 1.8;
                 const double target = std::max(0.0, reported);
-                if (g.lastSyncedPos < 0.0 || g.videoClockMs == 0) {
-                    g.playhead = target;
-                    g.videoClockPos = g.playhead;
-                    g.videoClockMs = now;
-                } else if (seekBack || seekFwd) {
-                    g.playhead = std::max(0.0, raw);
-                    g.videoClockPos = g.playhead;
-                    g.videoClockMs = now;
-                } else if (np.playing || g.playing) {
-                    const double elapsed = (now - g.videoClockMs) / 1000.0;
-                    g.playhead = g.videoClockPos + std::max(0.0, elapsed);
-                    const double err = target - g.playhead;
-                    const double maxErr = np.fromBiliBar ? 2.5 : 1.6;
-                    if (!frozenZero && std::abs(err) > 0.08 && std::abs(err) < maxErr) {
-                        g.playhead += err * (np.fromBiliBar ? 0.65 : 0.45);
+                if (staleAfterSeek && !rawMoved) {
+                    if (np.playing || g.playing) {
+                        const double elapsed = (now - g.videoClockMs) / 1000.0;
+                        g.playhead = g.videoClockPos + std::max(0.0, elapsed);
+                    } else {
                         g.videoClockPos = g.playhead;
                         g.videoClockMs = now;
                     }
                 } else {
-                    g.videoClockPos = g.playhead;
-                    g.videoClockMs = now;
+                    if (g.lastManualSeekTarget >= 0.0 &&
+                        (std::abs(probePos - g.lastManualSeekTarget) <= 1.5 ||
+                         std::abs(probePos - g.playhead) <= 1.8 || rawMoved)) {
+                        g.lastManualSeekTarget = -1.0;
+                    }
+                    if (g.lastSyncedPos < 0.0 || g.videoClockMs == 0) {
+                        g.playhead = target;
+                        g.videoClockPos = g.playhead;
+                        g.videoClockMs = now;
+                    } else if (seekBack || seekFwd) {
+                        g.playhead = std::max(0.0, raw);
+                        g.videoClockPos = g.playhead;
+                        g.videoClockMs = now;
+                    } else if (np.playing || g.playing) {
+                        const double elapsed = (now - g.videoClockMs) / 1000.0;
+                        g.playhead = g.videoClockPos + std::max(0.0, elapsed);
+                        if (np.fromBiliBar) {
+                            // B站时间常按整秒跳。整秒内自己匀速，只在明显落后/超前时轻校正。
+                            if (g.playhead < target - 0.08) {
+                                g.playhead += (target - g.playhead) * 0.22;
+                                g.videoClockPos = g.playhead;
+                                g.videoClockMs = now;
+                            } else if (g.playhead > target + 1.12) {
+                                g.playhead = target + 0.92;
+                                g.videoClockPos = g.playhead;
+                                g.videoClockMs = now;
+                            }
+                        } else {
+                            const double err = target - g.playhead;
+                            if (!frozenZero && std::abs(err) > 0.12 && std::abs(err) < 1.6) {
+                                g.playhead += err * 0.45;
+                                g.videoClockPos = g.playhead;
+                                g.videoClockMs = now;
+                            }
+                        }
+                    } else {
+                        g.videoClockPos = g.playhead;
+                        g.videoClockMs = now;
+                    }
+                    if (raw >= 0.0) g.lastRawVideoPos = raw;
                 }
-                if (raw >= 0.0) g.lastRawVideoPos = raw;
             } else {
-                if (trackChanged || g.lastSyncedPos < 0.0) {
-                    g.playhead = std::max(0.0, lyricReported);
-                } else if (std::abs(lyricReported - g.playhead) > 1.6) {
-                    g.playhead = std::max(0.0, lyricReported);
-                } else if (np.playing) {
-                    g.playhead += dt;
+                const bool staleAfterSeek = g.lastManualSeekTarget >= 0.0 &&
+                    std::abs(lyricReported - g.lastManualSeekTarget) > 1.5 &&
+                    std::abs(lyricReported - g.playhead) > 1.8;
+                if (staleAfterSeek) {
+                    if (np.playing) g.playhead += dt;
                 } else {
-                    g.playhead = std::max(0.0, lyricReported);
+                    if (g.lastManualSeekTarget >= 0.0) g.lastManualSeekTarget = -1.0;
+                    if (trackChanged || g.lastSyncedPos < 0.0) {
+                        g.playhead = std::max(0.0, lyricReported);
+                    } else if (std::abs(lyricReported - g.playhead) > 1.6) {
+                        g.playhead = std::max(0.0, lyricReported);
+                    } else if (np.playing) {
+                        g.playhead += dt;
+                    } else {
+                        g.playhead = std::max(0.0, lyricReported);
+                    }
                 }
             }
             if (!g.vocalClock && !videoAppEarly) {
@@ -2214,6 +2431,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     case WM_DESTROY:
+        if (g.overlayMem) {
+            SelectObject(g.overlayMem, g.overlayOld);
+            DeleteObject(g.overlayBmp);
+            DeleteDC(g.overlayMem);
+            g.overlayMem = nullptr;
+        }
         g.searcher.Stop();
         g.media.Stop();
         g.bili.Stop();
@@ -2306,7 +2529,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     g.identifier.Start();
     g.media.Start();
     g.bili.Start();
-    SetTimer(g.hwnd, kTimerId, 40, nullptr);
+    SetTimer(g.hwnd, kTimerId, 24, nullptr);
     ShowWindow(g.hwnd, SW_SHOW);
     UpdateWindow(g.hwnd);
 
